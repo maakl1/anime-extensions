@@ -44,6 +44,7 @@ import uy.kohesive.injekt.injectLazy
 import java.text.SimpleDateFormat
 import java.util.Collections
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.collections.isNotEmpty
 
 @Source
@@ -294,7 +295,11 @@ abstract class Anikage :
 
     override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
 
+    /** Reset per episode so an API change toasts once, not once per hoster. */
+    private val apiChangeToasted = AtomicBoolean(false)
+
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        apiChangeToasted.set(false)
         // The site reports which servers exist for this episode. The static list is
         // only used when that request fails; a successful answer is authoritative.
         val servers = getEpisodeServers(episode)
@@ -385,6 +390,7 @@ abstract class Anikage :
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    Log.w(name, "${hoster.hosterName} ${source.quality} failed", e)
                     failures += e
                     emptyList()
                 }
@@ -392,12 +398,8 @@ abstract class Anikage :
             if (videos.isEmpty() && failures.isNotEmpty()) throw failures.first()
 
             val timestamps = buildList {
-                data.intro?.takeIf { it.end > it.start }?.let {
-                    add(TimeStamp(it.start.toDouble(), it.end.toDouble(), "Intro", ChapterType.Opening))
-                }
-                data.outro?.takeIf { it.end > it.start }?.let {
-                    add(TimeStamp(it.start.toDouble(), it.end.toDouble(), "Outro", ChapterType.Ending))
-                }
+                data.intro?.toTimeStamp("Intro", ChapterType.Opening)?.let(::add)
+                data.outro?.toTimeStamp("Outro", ChapterType.Ending)?.let(::add)
             }
             val withChapters = if (timestamps.isEmpty()) videos else videos.map { it.copy(timestamps = timestamps) }
 
@@ -411,10 +413,16 @@ abstract class Anikage :
         throw e
     } catch (e: Exception) {
         Log.e(name, "${hoster.hosterName} failed", e)
-        if (e is SerializationException) {
-            showToast("Anikage: ${hoster.hosterName} sent an unexpected response")
+        if (e is SerializationException && apiChangeToasted.compareAndSet(false, true)) {
+            showToast("Anikage: the site sent an unexpected response")
         }
         throw e
+    }
+
+    private fun TimeRange.toTimeStamp(label: String, type: ChapterType): TimeStamp? {
+        val s = start ?: return null
+        val e = end ?: return null
+        return if (e > s) TimeStamp(s, e, label, type) else null
     }
 
     private fun isPreferredHoster(hoster: Hoster): Boolean = hoster.audioType() == preferences.subOrDub && hoster.provider() == preferredServerFor(hoster.audioType())
@@ -622,19 +630,21 @@ abstract class Anikage :
 
         private val AUDIO_TYPES = listOf("sub", "dub")
 
-        // Servers that serve a direct stream. Used for the settings lists and as the
+        // Servers the site currently reports. Used for the settings lists and as the
         // fallback when the server list cannot be fetched.
         private val PROVIDERS = listOf(
             "koto",
             "ken",
             "wave",
             "megg",
+            "kage",
+            "zen",
         )
 
-        // kite: the stream host answers 403 for its tokens, which makes the app attempt a
-        // Cloudflare bypass that stalls the episode. kage: answers 400 for every episode.
-        // zen: embed-only, never a direct stream.
-        private val UNSUPPORTED_PROVIDERS = setOf("kite", "kage", "zen")
+        // The stream host answers 403 for kite tokens, which makes the app spend ~15 s on
+        // a Cloudflare bypass for every episode. Other dead servers are left to fail
+        // visibly so they start working again without an update if the site fixes them.
+        private val UNSUPPORTED_PROVIDERS = setOf("kite")
         private val SUB_PROVIDER = PROVIDERS
         private val DUB_PROVIDER = PROVIDERS
 

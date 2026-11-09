@@ -163,8 +163,8 @@ class EpisodeSource(
 /** Seconds into the episode; the site sends zeros when it does not know. */
 @Serializable
 class TimeRange(
-    val start: Int = 0,
-    val end: Int = 0,
+    val start: Double? = null,
+    val end: Double? = null,
 )
 
 @Serializable

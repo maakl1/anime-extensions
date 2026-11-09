@@ -307,7 +307,6 @@ abstract class Anikage :
             PROVIDERS.associateWith { AUDIO_TYPES }
         } else {
             servers.groupBy({ it.providerId }, { it.subTypes })
-                .filterKeys { it !in UNSUPPORTED_PROVIDERS }
                 .mapValues { (_, types) -> types.flatten().distinct() }
         }
 
@@ -332,6 +331,7 @@ abstract class Anikage :
                 hosterUrl = "$baseUrl${episode.url}?lang=$type&provider=$provider",
                 hosterName = "$provider (${type.replaceFirstChar { it.uppercase() }})",
                 internalData = "$provider|$type",
+                lazy = provider in ON_DEMAND_PROVIDERS,
             )
         }
     }
@@ -641,10 +641,11 @@ abstract class Anikage :
             "zen",
         )
 
-        // The stream host answers 403 for kite tokens, which makes the app spend ~15 s on
-        // a Cloudflare bypass for every episode. Other dead servers are left to fail
-        // visibly so they start working again without an update if the site fixes them.
-        private val UNSUPPORTED_PROVIDERS = setOf("kite")
+        // Loaded only when the user picks them. The stream host answers 403 for kite
+        // tokens today, and that 403 makes the app spend ~15 s on a Cloudflare bypass;
+        // as a lazy hoster it costs nothing per episode and works again without an
+        // update if the site fixes it. Other dead servers are left to fail visibly.
+        private val ON_DEMAND_PROVIDERS = setOf("kite")
         private val SUB_PROVIDER = PROVIDERS
         private val DUB_PROVIDER = PROVIDERS
 

@@ -156,6 +156,15 @@ class EpisodeServers(
 class EpisodeSource(
     val sources: List<SourceData> = emptyList(),
     val subtitles: List<SubtitleData> = emptyList(),
+    val intro: TimeRange? = null,
+    val outro: TimeRange? = null,
+)
+
+/** Seconds into the episode; the site sends zeros when it does not know. */
+@Serializable
+class TimeRange(
+    val start: Int = 0,
+    val end: Int = 0,
 )
 
 @Serializable

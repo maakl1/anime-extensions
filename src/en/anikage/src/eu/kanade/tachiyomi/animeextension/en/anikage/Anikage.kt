@@ -13,9 +13,11 @@ import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimeUpdateStrategy
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.ChapterType
 import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
+import eu.kanade.tachiyomi.animesource.model.TimeStamp
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
@@ -389,10 +391,20 @@ abstract class Anikage :
             }.sortedByQuality()
             if (videos.isEmpty() && failures.isNotEmpty()) throw failures.first()
 
+            val timestamps = buildList {
+                data.intro?.takeIf { it.end > it.start }?.let {
+                    add(TimeStamp(it.start.toDouble(), it.end.toDouble(), "Intro", ChapterType.Opening))
+                }
+                data.outro?.takeIf { it.end > it.start }?.let {
+                    add(TimeStamp(it.start.toDouble(), it.end.toDouble(), "Outro", ChapterType.Ending))
+                }
+            }
+            val withChapters = if (timestamps.isEmpty()) videos else videos.map { it.copy(timestamps = timestamps) }
+
             if (isPreferredHoster(hoster)) {
-                videos.mapIndexed { index, video -> if (index == 0) video.copy(preferred = true) else video }
+                withChapters.mapIndexed { index, video -> if (index == 0) video.copy(preferred = true) else video }
             } else {
-                videos
+                withChapters
             }
         }
     } catch (e: CancellationException) {

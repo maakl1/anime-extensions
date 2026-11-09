@@ -1,7 +1,11 @@
 package eu.kanade.tachiyomi.animeextension.en.anikage
 
+import android.app.Application
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.playlistutils.PlaylistUtils
@@ -9,16 +13,17 @@ import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimeUpdateStrategy
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
-import keiyoushi.utils.AnimeHttpLegacySource
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
@@ -26,12 +31,14 @@ import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.SerializationException
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
+import uy.kohesive.injekt.injectLazy
 import java.text.SimpleDateFormat
 import java.util.Collections
 import java.util.Locale
@@ -39,7 +46,7 @@ import kotlin.collections.isNotEmpty
 
 @Source
 abstract class Anikage :
-    AnimeHttpLegacySource(),
+    AnimeHttpSource(),
     ConfigurableAnimeSource {
 
     override val supportsLatest: Boolean = true
@@ -58,12 +65,7 @@ abstract class Anikage :
 
     private val preferences by getPreferencesLazy()
 
-    /**
-     * The neko provider serves AniNeko streams whose segments are wrapped
-     * in a fake PNG header, so they must pass through a local proxy that
-     * strips it before playback.
-     */
-    private val localProxy by lazy { LocalProxy(client) }
+    private val context: Application by injectLazy()
 
     // ============================== Popular ===============================
 
@@ -284,157 +286,141 @@ abstract class Anikage :
         return episode
     }
 
-    // =========================== Video Links ==============================
+    // ============================== Hosters ===============================
 
-    private fun videoListRequestUrl(episode: SEpisode, lang: String, provider: String): String = "$baseUrl${episode.url}?lang=$lang&provider=$provider"
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
 
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val isDubPreferred = preferences.subOrDub == "dub"
-        val primaryLabel = if (isDubPreferred) "Dub" else "Sub"
-        val secondaryLabel = if (isDubPreferred) "Sub" else "Dub"
-        val preferredSource = if (isDubPreferred) preferences.dubSource else preferences.subSource
-        val otherSource = if (isDubPreferred) preferences.subSource else preferences.dubSource
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
 
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
         // The site reports which servers exist for this episode. The static list is
         // only used when that request fails; a successful answer is authoritative.
         val servers = getEpisodeServers(episode)
-        val availability = servers.orEmpty()
-            .groupBy({ it.providerId }, { it.subTypes })
-            .mapValues { (_, types) -> types.flatten().distinct() }
-        val knownProviders = if (servers == null) {
-            PROVIDERS
+        val offered: Map<String, List<String>> = if (servers == null) {
+            PROVIDERS.associateWith { AUDIO_TYPES }
         } else {
-            availability.keys.filterNot { it in UNSUPPORTED_PROVIDERS }
+            servers.groupBy({ it.providerId }, { it.subTypes })
+                .filterKeys { it !in UNSUPPORTED_PROVIDERS }
+                .mapValues { (_, types) -> types.flatten().distinct() }
         }
 
-        val primaryProviders = knownProviders.sortedByDescending { it == preferredSource }
-        val secondaryProviders = knownProviders.sortedByDescending { it == otherSource }
-
-        fun List<String>.offering(type: String) = if (servers == null) {
-            this
-        } else {
-            filter { availability[it].orEmpty().contains(type) }
+        val candidates = AUDIO_TYPES.flatMap { type ->
+            offered.filterValues { type in it }.keys.map { provider -> provider to type }
         }
-
-        val providers = primaryProviders.offering(primaryLabel.lowercase()).map { primaryLabel to it } +
-            secondaryProviders.offering(secondaryLabel.lowercase()).map { secondaryLabel to it }
-        if (providers.isEmpty()) {
+        if (candidates.isEmpty()) {
             // The site answered but has nothing for this episode; the app reports that.
             return emptyList()
         }
 
         val excludedServers = preferences.excludedServers
         val excludedTypes = preferences.excludedTypes
-        val activeProviders = providers.filter { (type, provider) ->
-            provider !in excludedServers && type.lowercase() !in excludedTypes
-        }
-        if (activeProviders.isEmpty()) {
-            val offered = providers.joinToString { (type, provider) -> "$provider ($type)" }
-            throw Exception("All streams offered for this episode ($offered) are excluded in the extension settings")
+        val active = candidates.filter { (provider, type) -> provider !in excludedServers && type !in excludedTypes }
+        if (active.isEmpty()) {
+            val offeredNames = candidates.map { it.first }.distinct().joinToString()
+            throw Exception("All servers offering this episode ($offeredNames) are excluded in the extension settings")
         }
 
-        val playlistUtils = PlaylistUtils(client, headers)
-        val failures = Collections.synchronizedList(mutableListOf<String>())
-        val extractionFailures = Collections.synchronizedList(mutableListOf<String>())
-        val emptyProviders = Collections.synchronizedList(mutableListOf<String>())
-        fun recordFailure(label: String, e: Exception, extraction: Boolean = false) {
-            Log.e(name, "$label failed", e)
-            val detail = "$label: ${e.message ?: e.javaClass.simpleName}"
-            failures += detail
-            if (extraction) extractionFailures += detail
+        return active.map { (provider, type) ->
+            Hoster(
+                hosterUrl = "$baseUrl${episode.url}?lang=$type&provider=$provider",
+                hosterName = "$provider (${type.replaceFirstChar { it.uppercase() }})",
+                internalData = "$provider|$type",
+            )
         }
+    }
 
-        val videos = activeProviders.parallelCatchingFlatMap { (type, provider) ->
-            val label = "$provider ($type)"
-            val episodeData = try {
-                client.newCall(
-                    GET(videoListRequestUrl(episode, type.lowercase(), provider), headers),
-                )
-                    .awaitSuccess()
-                    .parseAs<EpisodeSource>()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                recordFailure(label, e)
-                return@parallelCatchingFlatMap emptyList()
-            }
-            if (episodeData.sources.isEmpty()) {
-                emptyProviders += label
-                return@parallelCatchingFlatMap emptyList()
-            }
+    override fun List<Hoster>.sortHosters(): List<Hoster> {
+        val preferredType = preferences.subOrDub
+        return sortedWith(
+            compareByDescending<Hoster> { it.audioType() == preferredType }
+                .thenByDescending { it.provider() == preferredServerFor(it.audioType()) },
+        )
+    }
 
-            val tracks = episodeData.subtitles.mapIndexed { index, subtitle ->
+    private fun Hoster.provider(): String = internalData.substringBefore("|")
+
+    private fun Hoster.audioType(): String = internalData.substringAfter("|")
+
+    private fun preferredServerFor(type: String): String = if (type == "dub") preferences.dubSource else preferences.subSource
+
+    // =========================== Video Links ==============================
+
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = try {
+        val data = client.get(hoster.hosterUrl, headers).parseAs<EpisodeSource>()
+        if (data.sources.isEmpty()) {
+            emptyList()
+        } else {
+            val tracks = data.subtitles.mapIndexed { index, subtitle ->
                 val name = subtitle.label ?: "${subtitle.kind ?: "Subtitle"} ${index + 1}"
                 Track("https://og.bakayaro.live/stream/${subtitle.file}", name)
             }
+            val playlistUtils = PlaylistUtils(client, headers)
 
-            episodeData.sources.parallelCatchingFlatMap { source ->
+            // One bad source must not sink the hoster, but a hoster whose every source
+            // failed is an error, so the app marks it as such instead of showing nothing.
+            val failures = Collections.synchronizedList(mutableListOf<Exception>())
+            val videos = data.sources.parallelCatchingFlatMap { source ->
                 try {
-                    val videoUrl = source.episodeSourceUrl()
-                    if (source.isM3U8 == true && isHlsPlaylist(videoUrl)) {
-                        val effectiveUrl = if (provider == "neko") {
-                            localProxy.getProxyUrl(videoUrl, headers)
-                        } else {
-                            videoUrl
-                        }
+                    val url = source.episodeSourceUrl()
+                    if (source.isM3U8 == true && isHlsPlaylist(url)) {
                         playlistUtils.extractFromHls(
-                            playlistUrl = effectiveUrl,
+                            playlistUrl = url,
                             masterHeaders = headers,
                             videoHeaders = headers,
-                            videoNameGen = { "$type - $provider - ${source.quality} - $it" },
+                            videoNameGen = { "${source.quality} - $it" },
                             subtitleList = tracks,
                         )
                     } else {
-                        Video(
-                            url = videoUrl,
-                            quality = "$type - $provider - ${source.quality}",
-                            videoUrl = videoUrl,
-                            subtitleTracks = tracks,
-                            headers = headers,
-                        ).let(::listOf)
+                        listOf(
+                            Video(
+                                videoUrl = url,
+                                videoTitle = source.quality,
+                                headers = headers,
+                                subtitleTracks = tracks,
+                            ),
+                        )
                     }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    recordFailure("$label ${source.quality}", e, extraction = true)
+                    failures += e
                     emptyList()
                 }
+            }.sortedByQuality()
+            if (videos.isEmpty() && failures.isNotEmpty()) throw failures.first()
+
+            if (isPreferredHoster(hoster)) {
+                videos.mapIndexed { index, video -> if (index == 0) video.copy(preferred = true) else video }
+            } else {
+                videos
             }
         }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.e(name, "${hoster.hosterName} failed", e)
+        if (e is SerializationException) {
+            showToast("Anikage: ${hoster.hosterName} sent an unexpected response")
+        }
+        throw e
+    }
 
-        return when {
-            videos.isNotEmpty() -> videos
-            // A server offered a stream that could not be fetched: that is breakage, report it.
-            extractionFailures.isNotEmpty() -> throw Exception("No videos found: ${failures.joinToString("; ")}")
-            // Every server that answered had no stream: a legitimately empty episode.
-            failures.isEmpty() || emptyProviders.isNotEmpty() -> emptyList()
-            // Every server failed: say how, so the breakage can be reported.
-            else -> throw Exception("No videos found: ${failures.joinToString("; ")}")
+    private fun isPreferredHoster(hoster: Hoster): Boolean = hoster.audioType() == preferences.subOrDub && hoster.provider() == preferredServerFor(hoster.audioType())
+
+    private fun showToast(message: String) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
         }
     }
 
-    override fun List<Video>.sortVideos(): List<Video> {
-        val isDubPreferred = preferences.subOrDub == "dub"
-        val quality = preferences.quality
-        val primaryType = if (isDubPreferred) "Dub" else "Sub"
-        val secondaryType = if (isDubPreferred) "Sub" else "Dub"
-        val preferredServer = if (isDubPreferred) preferences.dubSource else preferences.subSource
-        val qualitiesList = PREF_QUALITY_ENTRIES.reversed()
+    override fun List<Video>.sortVideos(): List<Video> = sortedByQuality()
 
+    private fun List<Video>.sortedByQuality(): List<Video> {
+        val quality = preferences.quality
+        val qualitiesList = PREF_QUALITY_ENTRIES.reversed()
         return sortedWith(
             compareByDescending<Video> { it.videoTitle.contains(quality) }
-                .thenByDescending { video -> qualitiesList.indexOfLast { video.videoTitle.contains(it) } }
-                .thenByDescending { video ->
-                    when {
-                        video.videoTitle.contains(primaryType, ignoreCase = true) -> 2
-                        video.videoTitle.contains(secondaryType, ignoreCase = true) -> 1
-                        else -> 0
-                    }
-                }
-                .thenByDescending { video ->
-                    val videoServer = video.videoTitle.substringAfter(" - ").substringBefore(" - ")
-                    if (videoServer.equals(preferredServer, ignoreCase = true)) 1 else 0
-                },
+                .thenByDescending { video -> qualitiesList.indexOfLast { video.videoTitle.contains(it) } },
         )
     }
 
@@ -622,20 +608,21 @@ abstract class Anikage :
         private const val PREF_ADULT_KEY = "nsfw"
         private const val PREF_ADULT_DEFAULT = false
 
-        // Servers the site currently reports. Used for the settings lists and as the
+        private val AUDIO_TYPES = listOf("sub", "dub")
+
+        // Servers that serve a direct stream. Used for the settings lists and as the
         // fallback when the server list cannot be fetched.
         private val PROVIDERS = listOf(
             "koto",
             "ken",
             "wave",
             "megg",
-            "kage",
-            "zen",
         )
 
-        // The stream host answers 403 for kite tokens, and that 403 makes the app
-        // attempt a Cloudflare bypass that stalls every episode start.
-        private val UNSUPPORTED_PROVIDERS = setOf("kite")
+        // kite: the stream host answers 403 for its tokens, which makes the app attempt a
+        // Cloudflare bypass that stalls the episode. kage: answers 400 for every episode.
+        // zen: embed-only, never a direct stream.
+        private val UNSUPPORTED_PROVIDERS = setOf("kite", "kage", "zen")
         private val SUB_PROVIDER = PROVIDERS
         private val DUB_PROVIDER = PROVIDERS
 

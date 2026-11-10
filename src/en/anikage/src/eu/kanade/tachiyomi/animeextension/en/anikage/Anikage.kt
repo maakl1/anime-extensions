@@ -322,8 +322,8 @@ abstract class Anikage :
         val excludedTypes = preferences.excludedTypes
         val active = candidates.filter { (provider, type) -> provider !in excludedServers && type !in excludedTypes }
         if (active.isEmpty()) {
-            val offeredNames = candidates.map { it.first }.distinct().joinToString()
-            throw Exception("All servers offering this episode ($offeredNames) are excluded in the extension settings")
+            val offered = candidates.joinToString { (provider, type) -> "$provider (${type.replaceFirstChar { it.uppercase() }})" }
+            throw Exception("All streams offered for this episode ($offered) are excluded in the extension settings")
         }
 
         return active.map { (provider, type) ->
